@@ -1,0 +1,924 @@
+/*
+ * ============================================================================
+ * MessageScheduler - Complete Prompt Reference
+ * ============================================================================
+ * 
+ * ONE-TIME: RELATIVE DELAY (from now, preserves current time)
+ * ----------------------------------------------------------------------------
+ * /schedule message:"Check server status" time:"30m"
+ * /schedule message:"Standup reminder" time:"2h 15m"
+ * /schedule message:"Daily backup trigger" time:"1d"
+ * /schedule message:"Quick ping" time:"10s"
+ * 
+ * ONE-TIME: EXACT TIME (next occurrence today/tomorrow)
+ * ----------------------------------------------------------------------------
+ * /schedule message:"Meeting starts soon" time:"14:30"
+ * /schedule message:"Lunch break" time:"12pm"
+ * /schedule message:"Evening sync" time:"6:30 pm"
+ * /schedule message:"Nightly report" time:"23"
+ * 
+ * ONE-TIME: RELATIVE + SPECIFIC TIME (X days from now at exact time)
+ * ----------------------------------------------------------------------------
+ * /schedule message:"Deployment window" time:"3 days at 2am"
+ * /schedule message:"Client demo prep" time:"2 days at 10:30am"
+ * /schedule message:"Maintenance alert" time:"5 days at 9:00 pm"
+ * /schedule message:"Review deadline" time:"1 day at 5pm"
+ * 
+ * RECURRING: DAILY (every day at configured time)
+ * ----------------------------------------------------------------------------
+ * /schedule message:"Morning standup" time:"every day at 9am"
+ * /schedule message:"Daily digest" time:"every day at 6pm"
+ * /schedule message:"Nightly cleanup" time:"every day at 23:30"
+ * /schedule message:"Midnight backup" time:"every day"
+ * 
+ * RECURRING: INTERVAL DAYS AT TIME (every N days at exact time)
+ * ----------------------------------------------------------------------------
+ * /schedule message:"Weekly sync" time:"every 7 days at 4pm"
+ * /schedule message:"Bi-weekly report" time:"every 14 days at 10am"
+ * /schedule message:"Monthly review" time:"every 30 days at 9:00 am"
+ * /schedule message:"Sprint planning" time:"every 3 days at 11am"
+ * 
+ * RECURRING: RAW INTERVAL UNITS (every N units, no fixed clock time)
+ * ----------------------------------------------------------------------------
+ * /schedule message:"Health check" time:"every 1h"
+ * /schedule message:"Data sync" time:"every 30m"
+ * /schedule message:"Cache refresh" time:"every 15m"
+ * /schedule message:"Weekly pulse" time:"every 7d"
+ * 
+ * RECURRING: WEEKLY (specific days at configured time)
+ * ----------------------------------------------------------------------------
+ * /schedule message:"Team retro" time:"every fri at 3pm"
+ * /schedule message:"Design review" time:"every tue,thu at 11am"
+ * /schedule message:"Weekend digest" time:"every sat,sun at 10:00 am"
+ * /schedule message:"Monday kickoff" time:"every mon at 9:30am"
+ * 
+ * RECURRING: WEEKLY (start-date aligned, uses start_date's day of week)
+ * ----------------------------------------------------------------------------
+ * /schedule message:"Project launch" time:"every week at 9am" start_date:"2026-06-01"
+ * /schedule message:"Beta feedback" time:"every week at 2pm" start_date:"next monday"
+ * /schedule message:"Weekly digest" time:"every week at 8:30pm" start_date:"2026-05-15T20:30"
+ * /schedule message:"Sprint review" time:"every week at 4pm" start_date:"tomorrow"
+ * 
+ * OPTIONAL: CATCH_UP FLAG (control behavior for missed messages)
+ * ----------------------------------------------------------------------------
+ * /schedule message:"Critical alert" time:"every 4h" catch_up:true
+ * /schedule message:"Optional tip" time:"every day at 12pm" catch_up:false
+ * /schedule message:"Urgent maintenance" time:"2 days at 3am" catch_up:true
+ * /schedule message:"Newsletter draft" time:"every mon at 9am" catch_up:false
+ * 
+ * OPTIONAL: START_DATE FORMATS (when to begin recurring schedule)
+ * ----------------------------------------------------------------------------
+ * start_date:"2026-05-07"           # ISO date only
+ * start_date:"2026-05-07T20:00"     # ISO datetime (24h)
+ * start_date:"2026-05-07 8:00pm"    # Readable datetime
+ * start_date:"next monday"          # Relative keyword
+ * start_date:"tomorrow"             # Relative keyword
+ * start_date:"05/07/2026"           # US format (MM/DD/YYYY)
+ * start_date:"07/05/2026"           # EU format (DD/MM/YYYY)
+ * 
+ * DEBUG & MANAGEMENT COMMANDS
+ * ----------------------------------------------------------------------------
+ * /scheduled                           # List scheduled messages (current channel)
+ * /scheduled global:true               # List scheduled messages (all channels)
+ * /scheduler-debug                     # View raw storage and parsed state
+ * /cancel-scheduled index:1            # Cancel message by index (1-based)
+ * /clear-all-scheduled                 # Clear all messages (current channel)
+ * /clear-all-scheduled global:true     # Clear all messages (globally)
+ * 
+ * SYNTAX RULES & COMMON PITFALLS
+ * ----------------------------------------------------------------------------
+ * ✅ Valid: "3 days at 8pm"           ❌ Invalid: "3days at 8pm" (needs space)
+ * ✅ Valid: "every 3 days at 8pm"     ❌ Invalid: "every 3day at 8pm" (use plural)
+ * ✅ Valid: "every mon,fri at 9am"    ❌ Invalid: "every monday,friday" (3-letter abbr)
+ * ✅ Valid: "start_date:\"2026-05-07\"" ❌ Invalid: "start_date:\"May 7\"" (use ISO)
+ * ✅ Valid: "every week at 8pm"       ❌ Invalid: "every week" (time required)
+ * ✅ Valid: "8pm", "20:00", "3:30 am" ❌ Invalid: "8:00", "20pm" (inconsistent)
+ * 
+ * SUPPORTED TIME FORMATS
+ * ----------------------------------------------------------------------------
+ * 12-hour:  "8pm", "3:30am", "12:00 pm", "9:15 AM"
+ * 24-hour:  "20:00", "09:30", "23", "00"
+ * Relative: "30m", "2h", "1d", "7d", "2h 30m", "1d 4h 15m"
+ * 
+ * RECURRING TYPE INDICATORS (shown in /scheduled output)
+ * ----------------------------------------------------------------------------
+ * (one-time)        → Single execution
+ * (daily)           → Every day at fixed time
+ * (interval_daily)  → Every N days at fixed time
+ * (interval)        → Every N milliseconds/units
+ * (weekly)          → Every week on specific day(s)
+ * 
+ * PLUGIN INFO
+ * ----------------------------------------------------------------------------
+ * Name: MessageScheduler
+ * Platform: Vencord (Discord Client Mod)
+ * License: GPL-3.0-or-later
+ * Features: Persistent storage, catch-up support, recurring schedules,
+ *           start date alignment, global/channel-scoped views
+ * 
+ * ============================================================================
+ */
+
+import {
+  ApplicationCommandInputType,
+  ApplicationCommandOptionType,
+  sendBotMessage,
+} from "@api/Commands";
+import { definePluginSettings } from "@api/Settings";
+import { sendMessage } from "@utils/discord";
+import { Logger } from "@utils/Logger";
+import definePlugin, { OptionType } from "@utils/types";
+import { moment } from "@webpack/common";
+
+interface ScheduledMessage {
+  id: number;
+  channelId: string;
+  content: string;
+  scheduledTime: number;
+  timeoutId: NodeJS.Timeout | null;
+  catchUpOnMissed: boolean;
+  startDate?: number; // ← NEW: Unix timestamp for when recurrence begins
+  recurring?: {
+    type: "interval" | "daily" | "weekly" | "interval_daily";
+    intervalMs?: number;
+    intervalDays?: number;
+    daysOfWeek?: number[];
+    targetHour?: number;
+    targetMinute?: number;
+  };
+}
+
+const settings = definePluginSettings({
+  showNotifications: {
+    type: OptionType.BOOLEAN,
+    description: "Show notifications when scheduled messages are sent",
+    default: true,
+  },
+  scheduledMessages: {
+    type: OptionType.STRING,
+    description: "Internal: Persisted schedules",
+    default: "[]",
+    hidden: true,
+  },
+});
+
+const scheduledMessages: ScheduledMessage[] = [];
+const logger = new Logger("MessageScheduler");
+let idCounter = 1;
+
+// ---------------- STORAGE ----------------
+
+function saveSchedules() {
+  try {
+    const data = scheduledMessages.map(m => ({
+      id: m.id,
+      channelId: m.channelId,
+      content: m.content,
+      scheduledTime: m.scheduledTime,
+      catchUpOnMissed: m.catchUpOnMissed,
+      startDate: m.startDate, // ← Added
+      recurring: m.recurring,
+    }));
+    settings.store.scheduledMessages = JSON.stringify(data);
+  } catch (e) {
+    logger.error("Save failed:", e);
+  }
+}
+
+function loadSchedules(): Array<Omit<ScheduledMessage, "timeoutId">> {
+  try {
+    const raw = settings.store.scheduledMessages;
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    logger.error("Load failed:", e);
+    return [];
+  }
+}
+// ---------------- DATE PARSING ----------------
+
+function parseStartDate(dateStr: string): number | null {
+  if (!dateStr) return null;
+
+  // Support formats: "YYYY-MM-DD", "YYYY-MM-DDTHH:mm", "YYYY-MM-DD HH:mm"
+  const formats = ["YYYY-MM-DD", "YYYY-MM-DDTHH:mm", "YYYY-MM-DD HH:mm", "MM/DD/YYYY", "DD/MM/YYYY"];
+
+  for (const format of formats) {
+    const date = moment(dateStr, format, true); // strict parsing
+    if (date.isValid()) {
+      return date.valueOf();
+    }
+  }
+
+  // Fallback: try relative dates like "tomorrow", "next monday"
+  const relative = moment(dateStr);
+  if (relative.isValid() && relative.isAfter(moment().subtract(1, "day"))) {
+    return relative.valueOf();
+  }
+
+  return null;
+}
+// ---------------- TIME PARSING ----------------
+
+function parseRelativeTime(timeStr: string): number | null {
+  const clean = timeStr.trim().toLowerCase();
+
+  // 1. Handle "X days at HH:MM" or "X days at HH:MM AM/PM" (MORE SPECIFIC - CHECK FIRST)
+  const daysAtTime = clean.match(/^(\d+)\s*days?\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
+  if (daysAtTime) {
+    const days = parseInt(daysAtTime[1]);
+    let hour = parseInt(daysAtTime[2]);
+    const minute = daysAtTime[3] ? parseInt(daysAtTime[3]) : 0;
+    const ampm = daysAtTime[4]?.toLowerCase();
+
+    if (ampm === "pm" && hour < 12) hour += 12;
+    if (ampm === "am" && hour === 12) hour = 0;
+
+    const target = moment().add(days, "days").hour(hour).minute(minute).second(0).millisecond(0);
+    const delay = target.diff(Date.now());
+    logger.log(`Parsed "${timeStr}" -> ${days} days at ${hour}:${minute} -> ${delay}ms`);
+    return delay;
+  }
+
+  // 2. Handle simple relative: "3d", "2h30m", "1d 4h"
+  // ✅ FIX: Add (?!\w) to prevent matching "3d" from "3 days"
+  const regex = /(\d+)\s*([dhms])(?!\w)/gi;
+  let match;
+  let totalMs = 0;
+  let found = false;
+  while ((match = regex.exec(clean)) !== null) {
+    found = true;
+    const val = parseInt(match[1], 10);
+    const unit = match[2].toLowerCase();
+    totalMs += val * { d: 86400000, h: 3600000, m: 60000, s: 1000 }[unit];
+  }
+
+  if (found) {
+    logger.log(`Parsed "${timeStr}" -> ${totalMs}ms`);
+    return totalMs;
+  }
+
+  return null;
+}
+
+function parseExactTime(timeStr: string): number | null {
+  const formats = ["h:mma", "h:mm a", "H:mm", "ha", "h a", "H"];
+  for (const format of formats) {
+    const date = moment(timeStr, format);
+    if (date.isValid()) {
+      let ts = date.valueOf();
+      if (ts < Date.now()) ts += 86400000;
+      return ts;
+    }
+  }
+  return null;
+}
+
+function parseRecurring(input: string) {
+  input = input.toLowerCase().trim();
+  const timeMatch = input.match(
+    /^every\s+(?:day\s+at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i,
+  );
+  if (timeMatch) {
+    let hour = parseInt(timeMatch[1]);
+    const minute = timeMatch[2] ? parseInt(timeMatch[2]) : 0;
+    const ampm = timeMatch[3]?.toLowerCase();
+    if (ampm) {
+      if (ampm === "pm" && hour < 12) hour += 12;
+      if (ampm === "am" && hour === 12) hour = 0;
+    }
+    if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) {
+      return { type: "daily" as const, targetHour: hour, targetMinute: minute };
+    }
+  }
+  const dayIntervalTimeMatch = input.match(
+    /^every\s+(\d+)\s*days?\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i,
+  );
+
+  if (dayIntervalTimeMatch) {
+    const intervalDays = parseInt(dayIntervalTimeMatch[1]);
+    let hour = parseInt(dayIntervalTimeMatch[2]);
+    const minute = dayIntervalTimeMatch[3]
+      ? parseInt(dayIntervalTimeMatch[3])
+      : 0;
+    const ampm = dayIntervalTimeMatch[4]?.toLowerCase();
+
+    if (ampm) {
+      if (ampm === "pm" && hour < 12) hour += 12;
+      if (ampm === "am" && hour === 12) hour = 0;
+    }
+
+    if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) {
+      return {
+        type: "interval_daily" as const,
+        intervalDays: intervalDays,
+        targetHour: hour,
+        targetMinute: minute,
+      };
+    }
+  }
+  const intervalMatch = input.match(/^every (\d+)([dhms])$/);
+  if (intervalMatch) {
+    const value = parseInt(intervalMatch[1]);
+    const unit = intervalMatch[2];
+    return {
+      type: "interval" as const,
+      intervalMs: value * { d: 86400000, h: 3600000, m: 60000, s: 1000 }[unit],
+    };
+  }
+  if (input === "every day")
+    return { type: "daily" as const, targetHour: 0, targetMinute: 0 };
+  // Add support for "every week" (defaults to same day of week)
+  if (input === "every week") {
+    // Don't default to a day - will be set from startDate later
+    return {
+      type: "weekly" as const,
+      daysOfWeek: undefined as undefined | number[], // Will be filled in later
+      targetHour: 0,
+      targetMinute: 0
+    };
+  }
+
+  const weekTimeMatch = input.match(
+    /^every\s+week\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i,
+  );
+  if (weekTimeMatch) {
+    let hour = parseInt(weekTimeMatch[1]);
+    const minute = weekTimeMatch[2] ? parseInt(weekTimeMatch[2]) : 0;
+    const ampm = weekTimeMatch[3]?.toLowerCase();
+
+    if (ampm) {
+      if (ampm === "pm" && hour < 12) hour += 12;
+      if (ampm === "am" && hour === 12) hour = 0;
+    }
+
+    // Don't set daysOfWeek yet - will use startDate
+    return {
+      type: "weekly" as const,
+      daysOfWeek: undefined as undefined | number[],
+      targetHour: hour,
+      targetMinute: minute,
+    };
+  }
+  const daysMatch = input.match(/^every (.+)$/);
+  if (daysMatch) {
+    const map = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+    const days = daysMatch[1]
+      .split(",")
+      .map(d => map[d.trim().slice(0, 3)])
+      .filter(d => d !== undefined);
+    if (days.length) return { type: "weekly" as const, daysOfWeek: days };
+  }
+  return null;
+}
+
+// ---------------- NEXT DELAY CALCULATOR ----------------
+
+function getNextDelay(
+  recurring: ScheduledMessage["recurring"],
+  fromTime: number = Date.now(),
+  startDate?: number, // ← NEW parameter
+): number {
+  if (!recurring) return 0;
+
+  // If startDate is in the future, calculate delay to that date first
+  if (startDate && startDate > fromTime) {
+    // For interval_daily/daily/weekly, align to the target time on startDate
+    if (recurring.type === "interval_daily" || recurring.type === "daily") {
+      const targetHour = recurring.targetHour ?? 0;
+      const targetMinute = recurring.targetMinute ?? 0;
+      const target = moment(startDate)
+        .hour(targetHour)
+        .minute(targetMinute)
+        .second(0)
+        .millisecond(0);
+      return target.diff(fromTime);
+    }
+    if (recurring.type === "weekly" && recurring.daysOfWeek?.length) {
+      // Find first matching dayOfWeek on or after startDate
+      const cursor = moment(startDate).startOf("day");
+      for (let i = 0; i < 7; i++) {
+        if (recurring.daysOfWeek.includes(cursor.day())) {
+          const target = cursor
+            .hour(recurring.targetHour ?? 0)
+            .minute(recurring.targetMinute ?? 0)
+            .second(0)
+            .millisecond(0);
+          return target.diff(fromTime);
+        }
+        cursor.add(1, "day");
+      }
+    }
+    // Fallback: just delay to startDate
+    return startDate - fromTime;
+  }
+
+  // Existing logic for when startDate is in the past or not set
+  if (recurring.type === "interval") return recurring.intervalMs!;
+
+  if (recurring.type === "interval_daily") {
+    const intervalDays = recurring.intervalDays!;
+    const targetHour = recurring.targetHour ?? 0;
+    const targetMinute = recurring.targetMinute ?? 0;
+
+    const target = moment(fromTime)
+      .hour(targetHour)
+      .minute(targetMinute)
+      .second(0)
+      .millisecond(0);
+
+    if (target.isBefore(fromTime)) {
+      target.add(intervalDays, "days");
+    }
+    return target.diff(fromTime);
+  }
+
+  if (recurring.type === "daily") {
+    const target = moment(fromTime)
+      .hour(recurring.targetHour ?? 0)
+      .minute(recurring.targetMinute ?? 0)
+      .second(0)
+      .millisecond(0);
+    if (target.isBefore(fromTime)) target.add(1, "day");
+    return target.diff(fromTime);
+  }
+
+
+  if (recurring.type === "weekly") {
+    // ✅ Handle case where daysOfWeek might be undefined
+    if (!recurring.daysOfWeek || recurring.daysOfWeek.length === 0) {
+      // Default to weekly interval (7 days)
+      return 7 * 86400000;
+    }
+
+    const now = moment(fromTime);
+    const currentDay = now.day();
+    let nextDay = recurring
+      .daysOfWeek.map(d => (d - currentDay + 7) % 7)
+      .filter(d => d > 0)
+      .sort((a, b) => a - b)[0];
+    if (nextDay === undefined) nextDay = 7;
+    return nextDay * 86400000;
+  }
+
+  return 0;
+}
+
+// ---------------- CORE SCHEDULER ----------------
+function scheduleMessage(
+  channelId: string,
+  content: string,
+  delay: number,
+  recurring?: ScheduledMessage["recurring"],
+  catchUpOnMissed: boolean = true,
+  startDate?: number,
+) {
+  const id = idCounter++;
+  const now = Date.now();
+  const scheduledTime = now + delay;
+
+  const entry: ScheduledMessage = {
+    id,
+    channelId,
+    content,
+    scheduledTime,
+    timeoutId: null,
+    catchUpOnMissed,
+    startDate,
+    recurring,
+  };
+
+  const execute = () => {
+    try {
+      sendMessage(channelId, { content });
+      if (settings.store.showNotifications) {
+        Vencord.Webpack.Common.Toasts.show({
+          type: Vencord.Webpack.Common.Toasts.Type.SUCCESS,
+          message: "Scheduled message sent!",
+          id: "vc-msg-sent",
+        });
+      }
+
+      if (recurring) {
+        const nextDelay = getNextDelay(recurring, Date.now(), entry.startDate);
+        entry.scheduledTime = Date.now() + nextDelay;
+        entry.timeoutId = setTimeout(execute, nextDelay);
+        saveSchedules();
+      } else {
+        const idx = scheduledMessages.findIndex(m => m.id === id);
+        if (idx !== -1) scheduledMessages.splice(idx, 1);
+        saveSchedules();
+      }
+    } catch (err) {
+      logger.error("Execute failed:", err);
+    }
+  };
+
+  // ✅ Use 'delay' directly (not actualDelay)
+  entry.timeoutId = setTimeout(execute, delay);
+  scheduledMessages.push(entry);
+  saveSchedules();
+
+  if (settings.store.showNotifications) {
+    Vencord.Webpack.Common.Toasts.show({
+      type: Vencord.Webpack.Common.Toasts.Type.SUCCESS,
+      message: `Scheduled for ${moment(scheduledTime).format("MMMM Do YYYY, h:mm:ss A")}${recurring ? " (recurring)" : ""}${startDate && startDate > now ? ` (starts ${moment(startDate).format("YYYY-MM-DD")})` : ""}`,
+      id: "vc-msg-scheduled",
+    });
+  }
+  return id;
+}
+
+// ---------------- PLUGIN ----------------
+
+export default definePlugin({
+  name: "MessageScheduler",
+  description: "Persistent scheduler with catch-up support",
+  authors: [{ name: "YourName", id: 0n }],
+  settings,
+
+  commands: [
+    {
+      name: "schedule",
+      description: "Schedule a message",
+      inputType: ApplicationCommandInputType.BUILT_IN,
+      options: [
+        {
+          name: "message",
+          type: ApplicationCommandOptionType.STRING,
+          required: true,
+        },
+        {
+          name: "time",
+          type: ApplicationCommandOptionType.STRING,
+          required: true,
+        },
+        {
+          name: "start_date", // ← NEW
+          type: ApplicationCommandOptionType.STRING,
+          required: false,
+          description: "When to start recurring (e.g., 2026-01-15, tomorrow)",
+        },
+        {
+          name: "catch_up",
+          type: ApplicationCommandOptionType.BOOLEAN,
+          required: false,
+          description: "Send immediately if missed while app was closed (default: true)",
+        },
+      ],
+      execute: (args, ctx) => {
+        const message = args.find(a => a.name === "message")?.value as string;
+        const timeStr = args.find(a => a.name === "time")?.value as string;
+        const startDateStr = args.find(a => a.name === "start_date")?.value as string | undefined;
+        const catchUp = args.find(a => a.name === "catch_up")?.value as boolean | undefined;
+
+        const recurring = parseRecurring(timeStr);
+        const startDate = startDateStr ? parseStartDate(startDateStr) : null;
+
+        // ✅ If weekly and no daysOfWeek set, use the start date's day
+        if (recurring?.type === "weekly" && !recurring.daysOfWeek && startDate) {
+          recurring.daysOfWeek = [moment(startDate).day()];
+        }
+        let delay: number | null = null;
+        let firstRunTime: number;
+        const now = Date.now();
+
+        if (recurring) {
+          // Calculate the FIRST run time
+          if (startDate && startDate > now) {
+            // Start date is in the future - combine it with recurring time
+            if (recurring.type === "interval_daily" || recurring.type === "daily") {
+              const targetHour = recurring.targetHour ?? 0;
+              const targetMinute = recurring.targetMinute ?? 0;
+
+              // ✅ Create first run by combining startDate with target time
+              const firstRun = moment(startDate)
+                .hour(targetHour)
+                .minute(targetMinute)
+                .second(0)
+                .millisecond(0);
+
+              firstRunTime = firstRun.valueOf();
+            } else if (recurring.type === "weekly") {
+              const targetHour = recurring.targetHour ?? 0;
+              const targetMinute = recurring.targetMinute ?? 0;
+
+              // For weekly, find the next matching day on/after startDate
+              const cursor = moment(startDate).startOf("day");
+              const targetDay = recurring.daysOfWeek?.[0];
+
+              if (targetDay !== undefined) {
+                // Adjust cursor to the target day of week
+                const daysToAdd = (targetDay - cursor.day() + 7) % 7;
+                cursor.add(daysToAdd, "days");
+              }
+
+              const firstRun = cursor
+                .hour(targetHour)
+                .minute(targetMinute)
+                .second(0)
+                .millisecond(0);
+
+              firstRunTime = firstRun.valueOf();
+            } else {
+              // For other types, just use startDate as-is
+              firstRunTime = startDate;
+            }
+          } else {
+            // No start date or it's in the past - calculate normally
+            firstRunTime = now + getNextDelay(recurring, now, startDate ?? undefined);
+          }
+
+          delay = firstRunTime - now;
+        } else {
+          // Non-recurring message
+          delay = parseRelativeTime(timeStr);
+          if (delay === null) {
+            const exact = parseExactTime(timeStr);
+            if (exact !== null) delay = exact - now;
+          }
+          firstRunTime = now + (delay ?? 0);
+        }
+
+        if (!delay || delay < 0) {
+          sendBotMessage(ctx.channel.id, {
+            content: "❌ Invalid time format or start date.",
+          });
+          return;
+        }
+
+        scheduleMessage(
+          ctx.channel.id,
+          message,
+          delay,
+          recurring || undefined,
+          catchUp ?? true,
+          startDate ?? undefined,
+        );
+
+        const firstRun = moment(firstRunTime).format("MMMM Do YYYY, h:mm:ss A");
+        sendBotMessage(ctx.channel.id, {
+          content: `✅ Scheduled${startDate ? ` (starts ${moment(startDate).format("YYYY-MM-DD")})` : ""} for ${firstRun}${recurring ? " (recurring)" : ""}`,
+        });
+      },
+    },
+
+    {
+      name: "scheduled",
+      description: "List scheduled messages",
+      inputType: ApplicationCommandInputType.BUILT_IN,
+      options: [
+        {
+          name: "global",
+          type: ApplicationCommandOptionType.BOOLEAN,
+          required: false,
+          description: "Show scheduled messages from all channels (default: false)",
+        },
+      ],
+      execute: (args, ctx) => {
+        const global = args.find(a => a.name === "global")?.value as boolean | undefined;
+
+        // Filter messages based on global flag
+        const msgs = global
+          ? scheduledMessages
+          : scheduledMessages.filter(m => m.channelId === ctx.channel.id);
+
+        if (!msgs.length) {
+          sendBotMessage(ctx.channel.id, {
+            content: global
+              ? "🌍 No scheduled messages found globally."
+              : "📭 No scheduled messages in this channel.",
+          });
+          return;
+        }
+
+        const list = msgs
+          .map((m, i) => {
+            const time = moment(m.scheduledTime).format("MMMM Do YYYY, h:mm:ss A");
+            let type = "one-time";
+            let intervalInfo = "";
+
+            if (m.recurring) {
+              type = m.recurring.type;
+
+              // Show interval details
+              if (type === "interval_daily") {
+                const days = m.recurring.intervalDays || 1;
+                const hour = m.recurring.targetHour ?? 0;
+                const minute = m.recurring.targetMinute ?? 0;
+                const timeStr = moment().hour(hour).minute(minute).format("h:mm A");
+                intervalInfo = `[every ${days} day${days > 1 ? "s" : ""} at ${timeStr}] `;
+              } else if (type === "interval") {
+                const ms = m.recurring.intervalMs || 0;
+                const days = Math.floor(ms / 86400000);
+                const hours = Math.floor((ms % 86400000) / 3600000);
+                const mins = Math.floor((ms % 3600000) / 60000);
+                const parts = [];
+                if (days > 0) parts.push(`${days}d`);
+                if (hours > 0) parts.push(`${hours}h`);
+                if (mins > 0) parts.push(`${mins}m`);
+                intervalInfo = `[every ${parts.join(" ")}] `;
+              } else if (type === "daily") {
+                const hour = m.recurring.targetHour ?? 0;
+                const minute = m.recurring.targetMinute ?? 0;
+                const timeStr = moment().hour(hour).minute(minute).format("h:mm A");
+                intervalInfo = `[daily at ${timeStr}] `;
+              } else if (type === "weekly") {
+                const days = m.recurring.daysOfWeek?.map(d =>
+                  ["sun", "mon", "tue", "wed", "thu", "fri", "sat"][d]
+                ).join(",") || "";
+                const hour = m.recurring.targetHour ?? 0;
+                const minute = m.recurring.targetMinute ?? 0;
+                const timeStr = moment().hour(hour).minute(minute).format("h:mm A");
+                intervalInfo = `[weekly on ${days} at ${timeStr}] `;
+              }
+            }
+
+            const icon = m.catchUpOnMissed ? "🔄" : "⏭️";
+            const channelInfo = global ? `<#${m.channelId}> | ` : "";
+            const startInfo = m.startDate ? ` [Starts: ${moment(m.startDate).format("YYYY-MM-DD")}]` : "";
+
+            return `${i + 1}. ${icon} (${type})${startInfo} ${intervalInfo}${channelInfo}${time} → ${m.content.slice(0, 40)}`;
+          })
+          .join("\n");
+
+        const header = global
+          ? `**🌍 Global Scheduled Messages** (${msgs.length} total):\n`
+          : `**📭 Scheduled in this channel** (${msgs.length} total):\n`;
+
+        sendBotMessage(ctx.channel.id, { content: header + list });
+      },
+    },
+
+    {
+      name: "cancel-scheduled",
+      description: "Cancel a scheduled message",
+      inputType: ApplicationCommandInputType.BUILT_IN,
+      options: [
+        {
+          name: "index",
+          type: ApplicationCommandOptionType.INTEGER,
+          required: true,
+        },
+      ],
+      execute: (args, ctx) => {
+        const index = args[0]?.value;
+        const msgs = scheduledMessages.filter(
+          m => m.channelId === ctx.channel.id,
+        );
+        if (!msgs.length || index <= 0 || index > msgs.length) {
+          sendBotMessage(ctx.channel.id, { content: "❌ Invalid index." });
+          return;
+        }
+        const msg = msgs[index - 1];
+        if (msg.timeoutId) clearTimeout(msg.timeoutId);
+        const globalIdx = scheduledMessages.findIndex(m => m.id === msg.id);
+        if (globalIdx !== -1) scheduledMessages.splice(globalIdx, 1);
+        saveSchedules();
+        sendBotMessage(ctx.channel.id, { content: "✅ Cancelled." });
+      },
+    },
+    {
+      name: "clear-all-scheduled",
+      description: "Clear all scheduled messages",
+      inputType: ApplicationCommandInputType.BUILT_IN,
+      options: [
+        {
+          name: "global",
+          type: ApplicationCommandOptionType.BOOLEAN,
+          required: false,
+          description: "Clear scheduled messages across all channels (default: false)",
+        },
+      ],
+      execute: (args, ctx) => {
+        const global = args.find(a => a.name === "global")?.value as boolean | undefined;
+        const toRemove = global
+          ? scheduledMessages
+          : scheduledMessages.filter(m => m.channelId === ctx.channel.id);
+
+        if (!toRemove.length) {
+          sendBotMessage(ctx.channel.id, {
+            content: global ? "✅ No scheduled messages to clear." : "✅ No scheduled messages in this channel.",
+          });
+          return;
+        }
+
+        // Clear all timeouts
+        for (const msg of toRemove) {
+          if (msg.timeoutId) clearTimeout(msg.timeoutId);
+        }
+
+        // Remove from array
+        if (global) {
+          scheduledMessages.length = 0;
+        } else {
+          const keeping = scheduledMessages.filter(m => m.channelId !== ctx.channel.id);
+          scheduledMessages.length = 0;
+          scheduledMessages.push(...keeping);
+        }
+
+        saveSchedules();
+        sendBotMessage(ctx.channel.id, {
+          content: `✅ Cleared ${toRemove.length} scheduled message${toRemove.length > 1 ? "s" : ""}.`,
+        });
+      },
+    },
+    {
+      name: "scheduler-debug",
+      description: "Check storage and state",
+      inputType: ApplicationCommandInputType.BUILT_IN,
+      execute: (_, ctx) => {
+        const raw = settings.store.scheduledMessages;
+        const count = scheduledMessages.length;
+        let output = `**Debug State:**\n• Active: ${count}\n• Storage: ${raw ? JSON.parse(raw).length : 0} items\n\n`;
+
+        try {
+          const saved = JSON.parse(raw || "[]");
+          saved.forEach((s: any, i: number) => {
+            const missed = s.scheduledTime < Date.now();
+            output += `${i + 1}. ${missed ? "⚠️ MISSED" : "⏳ Pending"} | CatchUp: ${s.catchUpOnMissed ? "✅" : ""} | Time: ${moment(s.scheduledTime).format("MMMM Do YYYY, h:mm:ss A")}\n   → ${s.content.slice(0, 50)}\n\n`;
+          });
+        } catch { }
+
+        sendBotMessage(ctx.channel.id, { content: output || "Empty storage." });
+      },
+    },
+  ],
+
+  start() {
+    logger.info("Initializing scheduler...");
+
+    // Clear old state
+    for (const msg of scheduledMessages)
+      if (msg.timeoutId) clearTimeout(msg.timeoutId);
+    scheduledMessages.length = 0;
+    idCounter = 1;
+
+    const saved = loadSchedules();
+    const now = Date.now();
+
+    // ⏳ CRITICAL: Wait 5s for Discord to fully hydrate channels & WebSocket
+    setTimeout(() => {
+      logger.log(`Processing ${saved.length} saved schedules...`);
+      let restored = 0;
+
+      for (const s of saved) {
+        try {
+          const isMissed = s.scheduledTime < now;
+          const shouldCatchUp = s.catchUpOnMissed ?? true;
+
+          logger.log(
+            `Checking: "${s.content.slice(0, 20)}..." | Missed: ${isMissed} | CatchUp: ${shouldCatchUp}`,
+          );
+
+          if (!s.recurring && isMissed) {
+            logger.log("⏭️ Skipping expired one-time message");
+            continue;
+          }
+
+          if (isMissed && shouldCatchUp) {
+            // ✅ CATCH-UP: Send immediately
+            logger.log("🚀 CATCH-UP: Sending missed message...");
+            try {
+              sendMessage(s.channelId, { content: s.content });
+              if (settings.store.showNotifications) {
+                Vencord.Webpack.Common.Toasts.show({
+                  type: Vencord.Webpack.Common.Toasts.Type.SUCCESS,
+                  message: "Caught up on missed message!",
+                  id: "vc-catchup-sent",
+                });
+              }
+            } catch (err) {
+              logger.error("Catch-up send failed:", err);
+            }
+          } else if (isMissed && !shouldCatchUp) {
+            logger.log("️ Skipping missed (catch_up=false)");
+          }
+
+          // Schedule NEXT occurrence regardless of catch-up
+          const nextDelay = getNextDelay(s.recurring, now);
+          scheduleMessage(
+            s.channelId,
+            s.content,
+            nextDelay,
+            s.recurring,
+            shouldCatchUp,
+          );
+          restored++;
+        } catch (err) {
+          logger.error("Restore failed:", err);
+        }
+      }
+      logger.info(`✅ Restored ${restored} schedules`);
+    }, 5000);
+  },
+
+  stop() {
+    logger.info("Stopping scheduler...");
+    for (const msg of scheduledMessages)
+      if (msg.timeoutId) clearTimeout(msg.timeoutId);
+    scheduledMessages.length = 0;
+    saveSchedules();
+  },
+});
